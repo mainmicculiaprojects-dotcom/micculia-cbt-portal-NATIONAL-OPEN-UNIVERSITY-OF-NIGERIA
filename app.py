@@ -2,13 +2,14 @@
 import os
 import uuid
 import random
+import json
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
 
 from flask import (
     Flask, request, redirect, url_for, session,
-    flash, send_file, abort
+    flash, abort
 )
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -17,13 +18,13 @@ from markupsafe import escape
 from pypdf import PdfReader
 from docx import Document
 from pptx import Presentation
+from google import genai
 
 app = Flask(__name__)
 
 app.config["SECRET_KEY"] = os.environ.get(
     "SECRET_KEY", "change-this-secret"
 )
-
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 
 UPLOAD_FOLDER = Path("student_uploads")
@@ -64,7 +65,9 @@ class Course(db.Model):
 
 class Question(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    course_id = db.Column(db.Integer, db.ForeignKey("course.id"), nullable=False)
+    course_id = db.Column(
+        db.Integer, db.ForeignKey("course.id"), nullable=False
+    )
     question = db.Column(db.Text, nullable=False)
     a = db.Column(db.String(500), nullable=False)
     b = db.Column(db.String(500), nullable=False)
@@ -86,12 +89,34 @@ class Attempt(db.Model):
 
 class StudyMaterial(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    user_id = db.Column(
+        db.Integer, db.ForeignKey("user.id"), nullable=False
+    )
     course_name = db.Column(db.String(200), nullable=False)
     original_name = db.Column(db.String(255), nullable=False)
     stored_name = db.Column(db.String(255), nullable=False)
     extracted_text = db.Column(db.Text, default="")
     uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+# NEW: PRIVATE AI-GENERATED QUESTIONS
+
+class GeneratedQuestion(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(
+        db.Integer, db.ForeignKey("user.id"), nullable=False
+    )
+    material_id = db.Column(
+        db.Integer, db.ForeignKey("study_material.id"), nullable=False
+    )
+    question = db.Column(db.Text, nullable=False)
+    a = db.Column(db.String(500), nullable=False)
+    b = db.Column(db.String(500), nullable=False)
+    c = db.Column(db.String(500), nullable=False)
+    d = db.Column(db.String(500), nullable=False)
+    answer = db.Column(db.String(1), nullable=False)
+    explanation = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
 # DOCUMENT READING
@@ -124,6 +149,123 @@ def extract_document_text(path):
                     text.append(shape.text)
 
     return "\n".join(text)[:200000]
+
+
+# AI QUESTION GENERATION
+
+def generate_ai_questions(material):
+    api_key = os.environ.get("GEMINI_API_KEY")
+
+    if not api_key:
+        raise ValueError("AI API key is not configured.")
+
+    client = genai.Client(api_key=api_key)
+
+    schema = {
+        "type": "OBJECT",
+        "properties": {
+            "questions": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "question": {"type": "STRING"},
+                        "a": {"type": "STRING"},
+                        "b": {"type": "STRING"},
+                        "c": {"type": "STRING"},
+                        "d": {"type": "STRING"},
+                        "answer": {
+                            "type": "STRING",
+                            "enum": ["A", "B", "C", "D"]
+                        },
+                        "explanation": {"type": "STRING"}
+                    },
+                    "required": [
+                        "question", "a", "b", "c", "d",
+                        "answer", "explanation"
+                    ]
+                }
+            }
+        },
+        "required": ["questions"]
+    }
+
+    prompt = f"""
+You are an experienced university examination question setter.
+
+Prepare exactly 30 high-quality multiple-choice examination
+questions based strictly on the student's study material below.
+
+Course: {material.course_name}
+
+Requirements:
+1. Questions must follow a university examination standard.
+2. Test understanding, application, analysis and recall.
+3. Each question must have four options: A, B, C and D.
+4. Only one option must be correct.
+5. Provide the correct answer letter.
+6. Give a clear explanation for every answer.
+7. Avoid repeated or nearly identical questions.
+8. Do not invent facts outside the supplied material.
+9. Questions must be clear and academically accurate.
+10. Distribute correct answer positions across A, B, C and D.
+
+STUDY MATERIAL:
+
+{material.extracted_text}
+"""
+
+    response = client.models.generate_content(
+        model=os.environ.get(
+            "GEMINI_MODEL", "gemini-3.8-flash"
+        ),
+        contents=prompt,
+        config={
+            "response_mime_type": "application/json",
+            "response_json_schema": schema,
+            "max_output_tokens": 8192,
+            "temperature": 0.4
+        }
+    )
+
+    if not response.text:
+        raise ValueError("AI returned an empty response.")
+
+    result = json.loads(response.text)
+    questions = result.get("questions", [])
+
+    if len(questions) != 30:
+        raise ValueError(
+            "AI did not generate exactly 30 questions. Please try again."
+        )
+
+    valid_questions = []
+
+    for q in questions:
+        answer = str(q.get("answer", "")).upper()
+
+        required_fields = [
+            "question", "a", "b", "c", "d", "explanation"
+        ]
+
+        if answer not in ["A", "B", "C", "D"]:
+            raise ValueError("AI generated an invalid answer.")
+
+        if any(not str(q.get(field, "")).strip()
+               for field in required_fields):
+            raise ValueError("AI generated an incomplete question.")
+
+        valid_questions.append({
+            "question": str(q["question"])[:10000],
+            "a": str(q["a"])[:500],
+            "b": str(q["b"])[:500],
+            "c": str(q["c"])[:500],
+            "d": str(q["d"])[:500],
+            "answer": answer,
+            "explanation": str(q["explanation"])[:10000]
+        })
+
+    return valid_questions
 
 
 # PAGE DESIGN
@@ -260,7 +402,6 @@ def register():
         db.session.add(user)
         db.session.commit()
 
-        flash("Account created. Please log in.")
         return redirect(url_for("login"))
 
     return page("""
@@ -346,11 +487,35 @@ def dashboard():
         for a in attempts
     ) or "<p>No examination attempts yet.</p>"
 
-    material_html = "".join(
-        f"<p>{escape(m.course_name)} — {escape(m.original_name)} "
-        f"<a href='/material/{m.id}'>View extracted text</a></p>"
-        for m in materials
-    ) or "<p>You have not uploaded any materials yet.</p>"
+    material_parts = []
+
+    for m in materials:
+        count = GeneratedQuestion.query.filter_by(
+            user_id=user.id,
+            material_id=m.id
+        ).count()
+
+        generated_link = (
+            f"<a href='/generated/{m.id}'>Practise {count} AI Questions</a>"
+            if count else
+            "<span class='muted'>No questions generated yet.</span>"
+        )
+
+        material_parts.append(f"""
+        <div class="card">
+        <b>{escape(m.course_name)}</b><br>
+        {escape(m.original_name)}<br>
+        <a href="/material/{m.id}">View extracted text</a>
+        <br>{generated_link}
+        <form method="post" action="/generate-questions/{m.id}">
+        <button type="submit">Generate Questions</button>
+        </form>
+        </div>
+        """)
+
+    material_html = "".join(material_parts) or (
+        "<p>You have not uploaded any materials yet.</p>"
+    )
 
     admin_link = (
         "<p><a href='/admin'>Open Admin Dashboard</a></p>"
@@ -360,6 +525,171 @@ def dashboard():
     return page(f"""
     <div class="card">
     <h2>Hello, {escape(user.name)}!</h2>
+    <p>Welcome to your independent student dashboard.</p>
+    {admin_link}
+    <a href="/logout">Logout</a>
+    </div>
+
+    <div class="card">
+    <h3>Upload Your NOUN Study Material</h3>
+    <p>Upload PDF, Word or PowerPoint course materials.</p>
+    <form action="/upload-material" method="post" enctype="multipart/form-data">
+    <input name="course_name" placeholder="Course code or course title" required>
+    <input type="file" name="material" accept=".pdf,.docx,.pptx" required>
+    <button type="submit">Upload Material</button>
+    </form>
+    <p class="muted">Maximum file size: 25MB. Your uploaded materials are private to your account.</p>
+    </div>
+
+    <div class="card">
+    <h3>My Uploaded Materials</h3>
+    {material_html}
+    </div>
+
+    <div class="card">
+    <h3>Available Courses</h3>
+    {course_html}
+    </div>
+
+    <div class="card">
+    <h3>Your Recent Results</h3>
+    {history}
+    </div>
+    """)
+
+
+# STUDENT MATERIAL UPLOAD
+
+@app.route("/upload-material", methods=["POST"])
+@login_required
+def upload_material():
+    file = request.files.get("material")
+    course_name = request.form.get("course_name", "").strip()
+
+    if not file or not file.filename or not course_name:
+        return page(
+            "<h3>Please provide a course name and select a file.</h3>"
+            "<a href='/dashboard'>Return to dashboard</a>"
+        )
+
+    if not allowed_file(file.filename):
+        return page(
+            "<h3>Unsupported file type. Upload PDF, DOCX or PPTX.</h3>"
+            "<a href='/dashboard'>Return to dashboard</a>"
+        )
+
+    original_name = secure_filename(file.filename)
+    extension = Path(original_name).suffix.lower()
+    stored_name = f"{uuid.uuid4().hex}{extension}"
+    filepath = UPLOAD_FOLDER / stored_name
+
+    try:
+        file.save(filepath)
+        extracted_text = extract_document_text(filepath)
+
+        if not extracted_text.strip():
+            filepath.unlink(missing_ok=True)
+            return page(
+                "<h3>No readable text was found in this document. "
+                "Scanned PDFs may need OCR.</h3>"
+                "<a href='/dashboard'>Return to dashboard</a>"
+            )
+
+        material = StudyMaterial(
+            user_id=session["user_id"],
+            course_name=course_name,
+            original_name=original_name,
+            stored_name=stored_name,
+            extracted_text=extracted_text
+        )
+
+        db.session.add(material)
+        db.session.commit()
+
+        return page("""
+        <div class="card">
+        <h2>Material uploaded successfully!</h2>
+        <p>Your document has been read and its text extracted.</p>
+        <p>Return to your dashboard and tap Generate Questions.</p>
+        <a class="btn" href="/dashboard">Return to Dashboard</a>
+        </div>
+        """)
+
+    except Exception:
+        db.session.rollback()
+        filepath.unlink(missing_ok=True)
+        return page(
+            "<h3>There was a problem reading this file. Please try again.</h3>"
+            "<a href='/dashboard'>Return to dashboard</a>"
+        )
+
+
+# GENERATE QUESTIONS FOR THE LOGGED-IN STUDENT
+
+@app.route("/generate-questions/<int:material_id>", methods=["POST"])
+@login_required
+def generate_questions(material_id):
+    material = db.session.get(StudyMaterial, material_id)
+
+    if not material or material.user_id != session["user_id"]:
+        abort(404)
+
+    try:
+        questions = generate_ai_questions(material)
+
+        # Replace previous generated questions only after
+        # the new set has been successfully generated.
+        GeneratedQuestion.query.filter_by(
+            user_id=session["user_id"],
+            material_id=material.id
+        ).delete()
+
+        for q in questions:
+            db.session.add(GeneratedQuestion(
+                user_id=session["user_id"],
+                material_id=material.id,
+                question=q["question"],
+                a=q["a"],
+                b=q["b"],
+                c=q["c"],
+                d=q["d"],
+                answer=q["answer"],
+                explanation=q["explanation"]
+            ))
+
+        db.session.commit()
+
+        return page(f"""
+        <div class="card">
+        <h2>Success!</h2>
+        <p>30 AI examination questions have been generated for
+        {escape(material.course_name)}.</p>
+        <a class="btn" href="/generated/{material.id}">
+        Start Practising
+        </a>
+        <a class="btn" href="/dashboard">Dashboard</a>
+        </div>
+        """)
+
+    except Exception as error:
+        db.session.rollback()
+        print("AI GENERATION ERROR:", str(error))
+
+        return page("""
+        <div class="card">
+        <h2>Question generation could not be completed.</h2>
+        <p>Please check your AI configuration or try again later.</p>
+        <a class="btn" href="/dashboard">Return to Dashboard</a>
+        </div>
+        """)
+
+
+# PRACTISE GENERATED QUESTIONS
+
+@app.route("/generated/<int:material_id>", methods=["GET", "POST"])
+@login_required
+def generated_exam(material_id):
+    material = db.session.get(StudyMaterial, mr.name)}!</h2>
     <p>Welcome to your independent student dashboard.</p>
     {admin_link}
     <a href="/logout">Logout</a>
