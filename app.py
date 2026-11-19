@@ -1,397 +1,509 @@
-
 import os
 import uuid
 import random
-import json
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
 
 from flask import (
     Flask, request, redirect, url_for, session,
-    flash, abort
+    flash, send_file, abort
 )
+
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from markupsafe import escape
+
 from pypdf import PdfReader
 from docx import Document
 from pptx import Presentation
+
 from google import genai
+
+
+# ==========================================
+# APPLICATION CONFIGURATION
+# ==========================================
 
 app = Flask(__name__)
 
 app.config["SECRET_KEY"] = os.environ.get(
-    "SECRET_KEY", "change-this-secret"
-)
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
-
-UPLOAD_FOLDER = Path("student_uploads")
-UPLOAD_FOLDER.mkdir(exist_ok=True)
-
-ALLOWED_EXTENSIONS = {"pdf", "docx", "pptx"}
-
-database_url = os.environ.get(
-    "DATABASE_URL", "sqlite:///micculia.db"
+    "SECRET_KEY", "change-this-secret-key"
 )
 
-if database_url.startswith("postgres://"):
-    database_url = database_url.replace(
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///micculia.db")
+
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace(
         "postgres://", "postgresql://", 1
     )
 
-app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
+UPLOAD_FOLDER = Path("uploads")
+UPLOAD_FOLDER.mkdir(exist_ok=True)
 
+ALLOWED_EXTENSIONS = {"pdf", "docx", "pptx"}
+
+
+# ==========================================
+# GEMINI AI CONFIGURATION
+# ==========================================
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get(
+    "GEMINI_MODEL", "gemini-2.5-flash"
+)
+
+gemini_client = None
+
+if GEMINI_API_KEY:
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+# ==========================================
 # DATABASE MODELS
+# ==========================================
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+
     name = db.Column(db.String(120), nullable=False)
-    email = db.Column(db.String(150), unique=True, nullable=False)
+
+    email = db.Column(
+        db.String(150), unique=True, nullable=False
+    )
+
     password = db.Column(db.String(255), nullable=False)
-    is_admin = db.Column(db.Boolean, default=False)
+
+    is_admin = db.Column(
+        db.Boolean, default=False
+    )
+
+    created_at = db.Column(
+        db.DateTime, default=datetime.utcnow
+    )
 
 
 class Course(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    code = db.Column(db.String(40), nullable=False)
-    title = db.Column(db.String(200), nullable=False)
+
+    code = db.Column(
+        db.String(30), nullable=False
+    )
+
+    title = db.Column(
+        db.String(200), nullable=False
+    )
 
 
 class Question(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+
     course_id = db.Column(
-        db.Integer, db.ForeignKey("course.id"), nullable=False
+        db.Integer, db.ForeignKey("course.id"),
+        nullable=False
     )
-    question = db.Column(db.Text, nullable=False)
-    a = db.Column(db.String(500), nullable=False)
-    b = db.Column(db.String(500), nullable=False)
-    c = db.Column(db.String(500), nullable=False)
-    d = db.Column(db.String(500), nullable=False)
-    answer = db.Column(db.String(1), nullable=False)
-    explanation = db.Column(db.Text, default="")
+
+    question_text = db.Column(
+        db.Text, nullable=False
+    )
+
+    option_a = db.Column(db.Text)
+    option_b = db.Column(db.Text)
+    option_c = db.Column(db.Text)
+    option_d = db.Column(db.Text)
+
+    correct_answer = db.Column(
+        db.String(1), nullable=False
+    )
+
+    explanation = db.Column(db.Text)
 
 
 class Attempt(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"))
-    course_id = db.Column(db.Integer, db.ForeignKey("course.id"))
-    score = db.Column(db.Integer)
-    total = db.Column(db.Integer)
-    exam_type = db.Column(db.String(30))
-    date = db.Column(db.DateTime, default=datetime.utcnow)
+
+    user_id = db.Column(
+        db.Integer, db.ForeignKey("user.id"),
+        nullable=False
+    )
+
+    course_id = db.Column(
+        db.Integer, db.ForeignKey("course.id"),
+        nullable=False
+    )
+
+    score = db.Column(db.Integer, default=0)
+
+    total_questions = db.Column(
+        db.Integer, default=0
+    )
+
+    exam_type = db.Column(
+        db.String(50), default="CBT"
+    )
+
+    created_at = db.Column(
+        db.DateTime, default=datetime.utcnow
+    )
 
 
 class StudyMaterial(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+
     user_id = db.Column(
-        db.Integer, db.ForeignKey("user.id"), nullable=False
+        db.Integer, db.ForeignKey("user.id"),
+        nullable=False
     )
-    course_name = db.Column(db.String(200), nullable=False)
-    original_name = db.Column(db.String(255), nullable=False)
-    stored_name = db.Column(db.String(255), nullable=False)
-    extracted_text = db.Column(db.Text, default="")
-    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    course_id = db.Column(
+        db.Integer, db.ForeignKey("course.id"),
+        nullable=True
+    )
 
-# NEW: PRIVATE AI-GENERATED QUESTIONS
+    filename = db.Column(
+        db.String(255), nullable=False
+    )
+
+    extracted_text = db.Column(db.Text)
+
+    uploaded_at = db.Column(
+        db.DateTime, default=datetime.utcnow
+    )
+
 
 class GeneratedQuestion(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+
     user_id = db.Column(
-        db.Integer, db.ForeignKey("user.id"), nullable=False
+        db.Integer, db.ForeignKey("user.id"),
+        nullable=False
     )
+
+    course_id = db.Column(
+        db.Integer, db.ForeignKey("course.id"),
+        nullable=True
+    )
+
     material_id = db.Column(
-        db.Integer, db.ForeignKey("study_material.id"), nullable=False
+        db.Integer, db.ForeignKey("study_material.id"),
+        nullable=True
     )
-    question = db.Column(db.Text, nullable=False)
-    a = db.Column(db.String(500), nullable=False)
-    b = db.Column(db.String(500), nullable=False)
-    c = db.Column(db.String(500), nullable=False)
-    d = db.Column(db.String(500), nullable=False)
-    answer = db.Column(db.String(1), nullable=False)
-    explanation = db.Column(db.Text, default="")
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    question_text = db.Column(db.Text, nullable=False)
+
+    option_a = db.Column(db.Text)
+    option_b = db.Column(db.Text)
+    option_c = db.Column(db.Text)
+    option_d = db.Column(db.Text)
+
+    correct_answer = db.Column(db.String(1))
+
+    explanation = db.Column(db.Text)
+
+    created_at = db.Column(
+        db.DateTime, default=datetime.utcnow
+    )
 
 
-# DOCUMENT READING
+# ==========================================
+# GENERAL HELPER FUNCTIONS
+# ==========================================
 
 def allowed_file(filename):
     return (
         "." in filename
-        and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+        and filename.rsplit(".", 1)[1].lower()
+        in ALLOWED_EXTENSIONS
     )
 
 
-def extract_document_text(path):
-    extension = path.suffix.lower()
-    text = []
+def current_user():
+    user_id = session.get("user_id")
 
-    if extension == ".pdf":
-        reader = PdfReader(str(path))
-        for page in reader.pages:
-            text.append(page.extract_text() or "")
+    if not user_id:
+        return None
 
-    elif extension == ".docx":
-        document = Document(str(path))
-        text.extend(p.text for p in document.paragraphs)
-
-    elif extension == ".pptx":
-        presentation = Presentation(str(path))
-        for slide in presentation.slides:
-            for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    text.append(shape.text)
-
-    return "\n".join(text)[:200000]
+    return db.session.get(User, user_id)
 
 
-# AI QUESTION GENERATION
+def login_required(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if not session.get("user_id"):
+            flash("Please log in first.")
+            return redirect(url_for("login"))
 
-def generate_ai_questions(material):
-    api_key = os.environ.get("GEMINI_API_KEY")
+        return function(*args, **kwargs)
 
-    if not api_key:
-        raise ValueError("AI API key is not configured.")
-
-    client = genai.Client(api_key=api_key)
-
-    schema = {
-        "type": "OBJECT",
-        "properties": {
-            "questions": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "question": {"type": "STRING"},
-                        "a": {"type": "STRING"},
-                        "b": {"type": "STRING"},
-                        "c": {"type": "STRING"},
-                        "d": {"type": "STRING"},
-                        "answer": {
-                            "type": "STRING",
-                            "enum": ["A", "B", "C", "D"]
-                        },
-                        "explanation": {"type": "STRING"}
-                    },
-                    "required": [
-                        "question", "a", "b", "c", "d",
-                        "answer", "explanation"
-                    ]
-                }
-            }
-        },
-        "required": ["questions"]
-    }
-
-    prompt = f"""
-You are an experienced university examination question setter.
-
-Prepare exactly 30 high-quality multiple-choice examination
-questions based strictly on the student's study material below.
-
-Course: {material.course_name}
-
-Requirements:
-1. Questions must follow a university examination standard.
-2. Test understanding, application, analysis and recall.
-3. Each question must have four options: A, B, C and D.
-4. Only one option must be correct.
-5. Provide the correct answer letter.
-6. Give a clear explanation for every answer.
-7. Avoid repeated or nearly identical questions.
-8. Do not invent facts outside the supplied material.
-9. Questions must be clear and academically accurate.
-10. Distribute correct answer positions across A, B, C and D.
-
-STUDY MATERIAL:
-
-{material.extracted_text}
-"""
-
-    response = client.models.generate_content(
-        model=os.environ.get(
-            "GEMINI_MODEL", "gemini-3.8-flash"
-        ),
-        contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_json_schema": schema,
-            "max_output_tokens": 8192,
-            "temperature": 0.4
-        }
-    )
-
-    if not response.text:
-        raise ValueError("AI returned an empty response.")
-
-    result = json.loads(response.text)
-    questions = result.get("questions", [])
-
-    if len(questions) != 30:
-        raise ValueError(
-            "AI did not generate exactly 30 questions. Please try again."
-        )
-
-    valid_questions = []
-
-    for q in questions:
-        answer = str(q.get("answer", "")).upper()
-
-        required_fields = [
-            "question", "a", "b", "c", "d", "explanation"
-        ]
-
-        if answer not in ["A", "B", "C", "D"]:
-            raise ValueError("AI generated an invalid answer.")
-
-        if any(not str(q.get(field, "")).strip()
-               for field in required_fields):
-            raise ValueError("AI generated an incomplete question.")
-
-        valid_questions.append({
-            "question": str(q["question"])[:10000],
-            "a": str(q["a"])[:500],
-            "b": str(q["b"])[:500],
-            "c": str(q["c"])[:500],
-            "d": str(q["d"])[:500],
-            "answer": answer,
-            "explanation": str(q["explanation"])[:10000]
-        })
-
-    return valid_questions
+    return wrapper
 
 
-# PAGE DESIGN
+def admin_required(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        user = current_user()
+
+        if not user or not user.is_admin:
+            abort(403)
+
+        return function(*args, **kwargs)
+
+    return wrapper
+
 
 def page(content):
+    user = current_user()
+
+    navigation = ""
+
+    if user:
+        navigation = """
+        <nav>
+            <a href="/">Dashboard</a>
+            <a href="/logout">Logout</a>
+        </nav>
+        """
+
     return f"""
     <!DOCTYPE html>
     <html>
     <head>
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>MICCULIA NOUN CONNECT</title>
-    <style>
-    body {{
-        font-family: Arial, sans-serif;
-        background: #f2f5fa;
-        margin: 0;
-        color: #17233c;
-    }}
-    header {{
-        background: #071b3a;
-        color: white;
-        padding: 22px;
-        text-align: center;
-    }}
-    main {{
-        max-width: 850px;
-        margin: 25px auto;
-        padding: 20px;
-    }}
-    .card {{
-        background: white;
-        padding: 22px;
-        margin: 15px 0;
-        border-radius: 12px;
-        box-shadow: 0 2px 9px #0001;
-    }}
-    input, select, textarea {{
-        width: 100%;
-        padding: 12px;
-        margin: 8px 0;
-        box-sizing: border-box;
-        border: 1px solid #ccd2dc;
-        border-radius: 6px;
-    }}
-    button, .btn {{
-        background: #d5a52c;
-        color: #071b3a;
-        border: 0;
-        padding: 12px 18px;
-        border-radius: 6px;
-        font-weight: bold;
-        cursor: pointer;
-        text-decoration: none;
-        display: inline-block;
-        margin: 5px 0;
-    }}
-    a {{ color: #164c8a; }}
-    .muted {{ color: #667085; font-size: 13px; }}
-    </style>
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
+
+        <title>MICCULIA NOUN CONNECT</title>
+
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background: #f3f5fa;
+                margin: 0;
+                color: #17233d;
+            }}
+
+            header {{
+                background: #10264d;
+                color: white;
+                padding: 20px;
+                text-align: center;
+            }}
+
+            nav {{
+                background: #17396d;
+                padding: 12px;
+                text-align: center;
+            }}
+
+            nav a {{
+                color: white;
+                margin: 10px;
+                text-decoration: none;
+            }}
+
+            main {{
+                max-width: 950px;
+                margin: 20px auto;
+                padding: 15px;
+            }}
+
+            .card {{
+                background: white;
+                padding: 20px;
+                margin-bottom: 18px;
+                border-radius: 10px;
+                box-shadow: 0 2px 8px #00000012;
+            }}
+
+            input, select, textarea {{
+                width: 100%;
+                padding: 12px;
+                margin: 8px 0;
+                box-sizing: border-box;
+                border: 1px solid #ccd3df;
+                border-radius: 6px;
+            }}
+
+            button, .btn {{
+                background: #17396d;
+                color: white;
+                padding: 12px 18px;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+                text-decoration: none;
+                display: inline-block;
+                margin: 5px 0;
+            }}
+
+            .gold {{
+                background: #c89b35;
+            }}
+
+            .question {{
+                padding: 15px;
+                border-bottom: 1px solid #ddd;
+            }}
+
+            .flash {{
+                background: #fff0c2;
+                padding: 12px;
+                margin: 10px 0;
+                border-radius: 6px;
+            }}
+
+            footer {{
+                text-align: center;
+                padding: 20px;
+                color: #666;
+            }}
+        </style>
     </head>
+
     <body>
-    <header>
-        <h2>MICCULIA NOUN CONNECT</h2>
-        <p>Your smarter NOUN examination preparation platform</p>
-    </header>
-    <main>{content}</main>
+
+        <header>
+            <h1>MICCULIA NOUN CONNECT</h1>
+            <p>Your smarter NOUN examination preparation platform</p>
+        </header>
+
+        {navigation}
+
+        <main>
+
+            {''.join(
+                '<div class="flash">' + str(escape(message)) + '</div>'
+                for message in []
+            )}
+
+            {content}
+
+        </main>
+
+        <footer>
+            MICCULIA INTERNATIONAL
+        </footer>
+
     </body>
     </html>
     """
 
 
-# ACCESS CONTROL
+def extract_text(filepath):
+    extension = filepath.suffix.lower()
 
-def login_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if "user_id" not in session:
-            return redirect(url_for("login"))
-        return fn(*args, **kwargs)
-    return wrapper
+    if extension == ".pdf":
+        reader = PdfReader(str(filepath))
+        return "\n".join(
+            page.extract_text() or ""
+            for page in reader.pages
+        )
 
+    if extension == ".docx":
+        document = Document(str(filepath))
+        return "\n".join(
+            paragraph.text
+            for paragraph in document.paragraphs
+        )
 
-def admin_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        user = db.session.get(User, session.get("user_id"))
-        if not user or not user.is_admin:
-            return "Access denied. Admin only.", 403
-        return fn(*args, **kwargs)
-    return wrapper
+    if extension == ".pptx":
+        presentation = Presentation(str(filepath))
+        texts = []
 
+        for slide in presentation.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    texts.append(shape.text)
 
-# HOME
+        return "\n".join(texts)
 
-@app.route("/")
-def home():
-    return page("""
-    <div class="card">
-    <h2>Welcome to MICCULIA NOUN CONNECT</h2>
-    <p>Prepare smarter. Practise effectively. Improve your examination performance.</p>
-    <a class="btn" href="/register">Create Student Account</a>
-    <a class="btn" href="/login">Login</a>
-    </div>
-    """)
+    return ""
 
 
-# STUDENT REGISTRATION
+# ==========================================
+# GEMINI QUESTION GENERATION
+# ==========================================
+
+def generate_ai_questions(material_text, course_code, number=30):
+
+    if not gemini_client:
+        raise ValueError(
+            "Gemini API key is not configured."
+        )
+
+    material_text = material_text[:30000]
+
+    prompt = f"""
+You are an expert National Open University of Nigeria
+(NOUN) examination question setter.
+
+Generate exactly {number} high-quality objective
+multiple-choice examination questions.
+
+Course: {course_code}
+
+Use ONLY the study material supplied below.
+
+Each question must have:
+- A clear examination-standard question.
+- Four options labelled A, B, C and D.
+- One correct answer.
+- A concise explanation.
+
+Return ONLY valid JSON in this format:
+
+[
+ {{
+  "question": "Question text",
+  "A": "Option A",
+  "B": "Option B",
+  "C": "Option C",
+  "D": "Option D",
+  "answer": "A",
+  "explanation": "Explanation"
+ }}
+]
+
+STUDY MATERIAL:
+
+{material_text}
+"""
+
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt
+    )
+
+    return response.text
+
+
+# ==========================================
+# AUTHENTICATION ROUTES
+# ==========================================
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
+
     if request.method == "POST":
+
         name = request.form.get("name", "").strip()
-        email = request.form.get("email", "").strip().lower()
+        email = request.form.get("email", "").lower().strip()
         password = request.form.get("password", "")
 
-        if not name or not email or len(password) < 6:
-            return page(
-                "<h3>Enter your details and use a password of at least 6 characters.</h3>"
-                "<a href='/register'>Try again</a>"
-            )
+        if not name or not email or not password:
+            flash("Complete all fields.")
+            return redirect(url_for("register"))
 
         if User.query.filter_by(email=email).first():
-            return page(
-                "<h3>Email already registered.</h3>"
-                "<a href='/register'>Go back</a>"
-            )
+            flash("This email is already registered.")
+            return redirect(url_for("register"))
 
         user = User(
             name=name,
@@ -402,645 +514,1023 @@ def register():
         db.session.add(user)
         db.session.commit()
 
+        flash("Registration successful. Please log in.")
+
         return redirect(url_for("login"))
 
     return page("""
     <div class="card">
-    <h2>Student Registration</h2>
-    <form method="post">
-    <input name="name" placeholder="Full name" required>
-    <input name="email" type="email" placeholder="Email address" required>
-    <input name="password" type="password" placeholder="Password (minimum 6 characters)" required>
-    <button>Create Account</button>
-    </form>
-    <a href="/login">Already registered? Login</a>
+        <h2>Create Student Account</h2>
+
+        <form method="POST">
+
+            <label>Full Name</label>
+            <input name="name" required>
+
+            <label>Email Address</label>
+            <input name="email" type="email" required>
+
+            <label>Password</label>
+            <input name="password" type="password" required>
+
+            <button type="submit">Register</button>
+
+        </form>
+
+        <p>Already registered?
+        <a href="/login">Login here</a></p>
     </div>
     """)
 
 
-# LOGIN
-
 @app.route("/login", methods=["GET", "POST"])
 def login():
+
     if request.method == "POST":
-        email = request.form.get("email", "").strip().lower()
+
+        email = request.form.get("email", "").lower().strip()
+        password = request.form.get("password", "")
+
         user = User.query.filter_by(email=email).first()
 
         if user and check_password_hash(
-            user.password, request.form.get("password", "")
+            user.password, password
         ):
-            session.clear()
+
             session["user_id"] = user.id
+
+            flash("Welcome back!")
+
             return redirect(url_for("dashboard"))
 
-        return page(
-            "<h3>Incorrect email or password.</h3>"
-            "<a href='/login'>Try again</a>"
-        )
+        flash("Invalid email or password.")
 
     return page("""
     <div class="card">
-    <h2>Login</h2>
-    <form method="post">
-    <input name="email" type="email" placeholder="Email address" required>
-    <input name="password" type="password" placeholder="Password" required>
-    <button>Login</button>
-    </form>
-    <a href="/register">Create account</a>
+        <h2>Student Login</h2>
+
+        <form method="POST">
+
+            <label>Email Address</label>
+            <input name="email" type="email" required>
+
+            <label>Password</label>
+            <input name="password" type="password" required>
+
+            <button type="submit">Login</button>
+
+        </form>
+
+        <p>New student?
+        <a href="/register">Create account</a></p>
     </div>
     """)
 
 
 @app.route("/logout")
 def logout():
+
     session.clear()
-    return redirect(url_for("home"))
+
+    flash("You have logged out.")
+
+    return redirect(url_for("login"))
 
 
+# ==========================================
 # STUDENT DASHBOARD
+# ==========================================
 
-@app.route("/dashboard")
+@app.route("/")
 @login_required
 def dashboard():
-    user = db.session.get(User, session["user_id"])
 
-    courses = Course.query.order_by(Course.code).all()
-
-    attempts = Attempt.query.filter_by(
-        user_id=user.id
-    ).order_by(Attempt.date.desc()).limit(10).all()
+    user = current_user()
 
     materials = StudyMaterial.query.filter_by(
         user_id=user.id
-    ).order_by(StudyMaterial.uploaded_at.desc()).all()
+    ).order_by(
+        StudyMaterial.uploaded_at.desc()
+    ).all()
 
-    course_html = "".join(
-        f"<p><b>{escape(c.code)}</b> - {escape(c.title)} "
-        f"<a href='/exam/{c.id}/tma'>TMA Practice</a> | "
-        f"<a href='/exam/{c.id}/semester'>Semester Practice</a></p>"
-        for c in courses
-    ) or "<p>No courses have been added yet.</p>"
+    courses = Course.query.order_by(
+        Course.code
+    ).all()
 
-    history = "".join(
-        f"<p>{escape(a.exam_type)} | Score: {a.score}/{a.total} "
-        f"| {a.date.strftime('%d %b %Y')}</p>"
-        for a in attempts
-    ) or "<p>No examination attempts yet.</p>"
+    attempts = Attempt.query.filter_by(
+        user_id=user.id
+    ).order_by(
+        Attempt.created_at.desc()
+    ).limit(10).all()
 
-    material_parts = []
+    material_html = ""
 
-    for m in materials:
-        count = GeneratedQuestion.query.filter_by(
-            user_id=user.id,
-            material_id=m.id
-        ).count()
-
-        generated_link = (
-            f"<a href='/generated/{m.id}'>Practise {count} AI Questions</a>"
-            if count else
-            "<span class='muted'>No questions generated yet.</span>"
-        )
-
-        material_parts.append(f"""
-        <div class="card">
-        <b>{escape(m.course_name)}</b><br>
-        {escape(m.original_name)}<br>
-        <a href="/material/{m.id}">View extracted text</a>
-        <br>{generated_link}
-        <form method="post" action="/generate-questions/{m.id}">
-        <button type="submit">Generate Questions</button>
-        </form>
+    for material in materials:
+        material_html += f"""
+        <div class="question">
+            <strong>{escape(material.filename)}</strong>
+            <p>Uploaded: {material.uploaded_at}</p>
+            <a href="/material/{material.id}">View extracted text</a>
         </div>
-        """)
+        """
 
-    material_html = "".join(material_parts) or (
-        "<p>You have not uploaded any materials yet.</p>"
-    )
+    course_html = ""
 
-    admin_link = (
-        "<p><a href='/admin'>Open Admin Dashboard</a></p>"
-        if user.is_admin else ""
-    )
+    for course in courses:
+        course_html += f"""
+        <div class="question">
+            <strong>{escape(course.code)}</strong>
+            — {escape(course.title)}
+            <br>
+            <a href="/exam/{course.id}">Start CBT</a>
+        </div>
+        """
+
+    result_html = ""
+
+    for attempt in attempts:
+        result_html += f"""
+        <div class="question">
+            Course ID: {attempt.course_id}
+            <br>
+            Score: {attempt.score}/{attempt.total_questions}
+            <br>
+            Date: {attempt.created_at}
+        </div>
+        """
 
     return page(f"""
     <div class="card">
-    <h2>Hello, {escape(user.name)}!</h2>
-    <p>Welcome to your independent student dashboard.</p>
-    {admin_link}
-    <a href="/logout">Logout</a>
+        <h2>Hello, {escape(user.name)}!</h2>
+        <p>Welcome to your independent student dashboard.</p>
+
+        {('<a class="btn gold" href="/admin">Open Admin Dashboard</a>' if user.is_admin else '')}
     </div>
 
     <div class="card">
-    <h3>Upload Your NOUN Study Material</h3>
-    <p>Upload PDF, Word or PowerPoint course materials.</p>
-    <form action="/upload-material" method="post" enctype="multipart/form-data">
-    <input name="course_name" placeholder="Course code or course title" required>
-    <input type="file" name="material" accept=".pdf,.docx,.pptx" required>
-    <button type="submit">Upload Material</button>
-    </form>
-    <p class="muted">Maximum file size: 25MB. Your uploaded materials are private to your account.</p>
+        <h2>Upload Your NOUN Study Material</h2>
+
+        <form action="/upload" method="POST"
+              enctype="multipart/form-data">
+
+            <label>Select Course</label>
+
+            <select name="course_id">
+                <option value="">Select course</option>
+                {''.join(
+                    f'<option value="{c.id}">{escape(c.code)} - {escape(c.title)}</option>'
+                    for c in courses
+                )}
+            </select>
+
+            <label>Select PDF, DOCX or PPTX file</label>
+
+            <input type="file" name="file"
+                   accept=".pdf,.docx,.pptx" required>
+
+            <button type="submit">Upload Material</button>
+
+        </form>
     </div>
 
     <div class="card">
-    <h3>My Uploaded Materials</h3>
-    {material_html}
+        <h2>My Uploaded Materials</h2>
+        {material_html or '<p>No materials uploaded yet.</p>'}
     </div>
 
     <div class="card">
-    <h3>Available Courses</h3>
-    {course_html}
+        <h2>Generate 30 AI Questions</h2>
+
+        <p>Generate practice questions from your uploaded
+        study material using Gemini AI.</p>
+
+        <form action="/generate-questions" method="POST">
+
+            <label>Select uploaded material</label>
+
+            <select name="material_id" required>
+                {''.join(
+                    f'<option value="{m.id}">{escape(m.filename)}</option>'
+                    for m in materials
+                )}
+            </select>
+
+            <button type="submit" class="gold">
+                Generate 30 AI Questions
+            </button>
+
+        </form>
     </div>
 
     <div class="card">
-    <h3>Your Recent Results</h3>
-    {history}
+        <h2>Available Courses</h2>
+        {course_html or '<p>No courses have been added yet.</p>'}
+    </div>
+
+    <div class="card">
+        <h2>Your Recent Results</h2>
+        {result_html or '<p>No examination attempts yet.</p>'}
     </div>
     """)
 
 
-# STUDENT MATERIAL UPLOAD
+# ==========================================
+# STUDY MATERIAL UPLOAD
+# ==========================================
 
-@app.route("/upload-material", methods=["POST"])
+@app.route("/upload", methods=["POST"])
 @login_required
 def upload_material():
-    file = request.files.get("material")
-    course_name = request.form.get("course_name", "").strip()
 
-    if not file or not file.filename or not course_name:
-        return page(
-            "<h3>Please provide a course name and select a file.</h3>"
-            "<a href='/dashboard'>Return to dashboard</a>"
-        )
+    file = request.files.get("file")
+
+    if not file or not file.filename:
+        flash("Please select a file.")
+        return redirect(url_for("dashboard"))
 
     if not allowed_file(file.filename):
-        return page(
-            "<h3>Unsupported file type. Upload PDF, DOCX or PPTX.</h3>"
-            "<a href='/dashboard'>Return to dashboard</a>"
-        )
+        flash("Only PDF, DOCX and PPTX files are allowed.")
+        return redirect(url_for("dashboard"))
 
-    original_name = secure_filename(file.filename)
-    extension = Path(original_name).suffix.lower()
-    stored_name = f"{uuid.uuid4().hex}{extension}"
-    filepath = UPLOAD_FOLDER / stored_name
+    filename = secure_filename(file.filename)
+
+    unique_name = str(uuid.uuid4()) + "_" + filename
+
+    filepath = UPLOAD_FOLDER / unique_name
+
+    file.save(filepath)
 
     try:
-        file.save(filepath)
-        extracted_text = extract_document_text(filepath)
-
-        if not extracted_text.strip():
-            filepath.unlink(missing_ok=True)
-            return page(
-                "<h3>No readable text was found in this document. "
-                "Scanned PDFs may need OCR.</h3>"
-                "<a href='/dashboard'>Return to dashboard</a>"
-            )
-
-        material = StudyMaterial(
-            user_id=session["user_id"],
-            course_name=course_name,
-            original_name=original_name,
-            stored_name=stored_name,
-            extracted_text=extracted_text
-        )
-
-        db.session.add(material)
-        db.session.commit()
-
-        return page("""
-        <div class="card">
-        <h2>Material uploaded successfully!</h2>
-        <p>Your document has been read and its text extracted.</p>
-        <p>Return to your dashboard and tap Generate Questions.</p>
-        <a class="btn" href="/dashboard">Return to Dashboard</a>
-        </div>
-        """)
-
+        text_content = extract_text(filepath)
     except Exception:
-        db.session.rollback()
         filepath.unlink(missing_ok=True)
-        return page(
-            "<h3>There was a problem reading this file. Please try again.</h3>"
-            "<a href='/dashboard'>Return to dashboard</a>"
-        )
+        flash("Could not read this document.")
+        return redirect(url_for("dashboard"))
 
-
-# GENERATE QUESTIONS FOR THE LOGGED-IN STUDENT
-
-@app.route("/generate-questions/<int:material_id>", methods=["POST"])
-@login_required
-def generate_questions(material_id):
-    material = db.session.get(StudyMaterial, material_id)
-
-    if not material or material.user_id != session["user_id"]:
-        abort(404)
-
-    try:
-        questions = generate_ai_questions(material)
-
-        # Replace previous generated questions only after
-        # the new set has been successfully generated.
-        GeneratedQuestion.query.filter_by(
-            user_id=session["user_id"],
-            material_id=material.id
-        ).delete()
-
-        for q in questions:
-            db.session.add(GeneratedQuestion(
-                user_id=session["user_id"],
-                material_id=material.id,
-                question=q["question"],
-                a=q["a"],
-                b=q["b"],
-                c=q["c"],
-                d=q["d"],
-                answer=q["answer"],
-                explanation=q["explanation"]
-            ))
-
-        db.session.commit()
-
-        return page(f"""
-        <div class="card">
-        <h2>Success!</h2>
-        <p>30 AI examination questions have been generated for
-        {escape(material.course_name)}.</p>
-        <a class="btn" href="/generated/{material.id}">
-        Start Practising
-        </a>
-        <a class="btn" href="/dashboard">Dashboard</a>
-        </div>
-        """)
-
-    except Exception as error:
-        db.session.rollback()
-        print("AI GENERATION ERROR:", str(error))
-
-        return page("""
-        <div class="card">
-        <h2>Question generation could not be completed.</h2>
-        <p>Please check your AI configuration or try again later.</p>
-        <a class="btn" href="/dashboard">Return to Dashboard</a>
-        </div>
-        """)
-
-
-# PRACTISE GENERATED QUESTIONS
-
-@app.route("/generated/<int:material_id>", methods=["GET", "POST"])
-@login_required
-def generated_exam(material_id):
-    material = db.session.get(StudyMaterial, mr.name)}!</h2>
-    <p>Welcome to your independent student dashboard.</p>
-    {admin_link}
-    <a href="/logout">Logout</a>
-    </div>
-
-    <div class="card">
-    <h3>Upload Your NOUN Study Material</h3>
-    <p>Upload PDF, Word or PowerPoint course materials.</p>
-    <form action="/upload-material" method="post" enctype="multipart/form-data">
-    <input name="course_name" placeholder="Course code or course title" required>
-    <input type="file" name="material" accept=".pdf,.docx,.pptx" required>
-    <button type="submit">Upload Material</button>
-    </form>
-    <p class="muted">Maximum file size: 25MB. Your uploaded materials are private to your account.</p>
-    </div>
-
-    <div class="card">
-    <h3>My Uploaded Materials</h3>
-    {material_html}
-    </div>
-
-    <div class="card">
-    <h3>Available Courses</h3>
-    {course_html}
-    </div>
-
-    <div class="card">
-    <h3>Your Recent Results</h3>
-    {history}
-    </div>
-    """)
-
-
-# STUDENT MATERIAL UPLOAD
-
-@app.route("/upload-material", methods=["POST"])
-@login_required
-def upload_material():
-    file = request.files.get("material")
-    course_name = request.form.get("course_name", "").strip()
-
-    if not file or not file.filename or not course_name:
-        return page(
-            "<h3>Please provide a course name and select a file.</h3>"
-            "<a href='/dashboard'>Return to dashboard</a>"
-        )
-
-    if not allowed_file(file.filename):
-        return page(
-            "<h3>Unsupported file type. Upload PDF, DOCX or PPTX.</h3>"
-            "<a href='/dashboard'>Return to dashboard</a>"
-        )
-
-    original_name = secure_filename(file.filename)
-
-    extension = Path(original_name).suffix.lower()
-    stored_name = f"{uuid.uuid4().hex}{extension}"
-    filepath = UPLOAD_FOLDER / stored_name
-
-    try:
-        file.save(filepath)
-        extracted_text = extract_document_text(filepath)
-
-        if not extracted_text.strip():
-            filepath.unlink(missing_ok=True)
-            return page(
-                "<h3>No readable text was found in this document. "
-                "Scanned PDFs may need OCR.</h3>"
-                "<a href='/dashboard'>Return to dashboard</a>"
-            )
-
-        material = StudyMaterial(
-            user_id=session["user_id"],
-            course_name=course_name,
-            original_name=original_name,
-            stored_name=stored_name,
-            extracted_text=extracted_text
-        )
-
-        db.session.add(material)
-        db.session.commit()
-
-        return page("""
-        <div class="card">
-        <h2>Material uploaded successfully!</h2>
-        <p>Your document has been read and its text extracted.</p>
-        <p>AI question generation will be connected in the next upgrade.</p>
-        <a class="btn" href="/dashboard">Return to Dashboard</a>
-        </div>
-        """)
-
-    except Exception:
-        db.session.rollback()
+    if not text_content.strip():
         filepath.unlink(missing_ok=True)
-        return page(
-            "<h3>There was a problem reading this file. Please try again.</h3>"
-            "<a href='/dashboard'>Return to dashboard</a>"
-        )
+        flash("No readable text was found in the document.")
+        return redirect(url_for("dashboard"))
 
+    course_id = request.form.get("course_id")
 
-# VIEW ONLY THE LOGGED-IN STUDENT'S MATERIAL
+    material = StudyMaterial(
+        user_id=session["user_id"],
+        course_id=int(course_id) if course_id else None,
+        filename=filename,
+        extracted_text=text_content
+    )
+
+    db.session.add(material)
+    db.session.commit()
+
+    flash("Study material uploaded successfully.")
+
+    return redirect(url_for("dashboard"))
+
 
 @app.route("/material/<int:material_id>")
 @login_required
 def view_material(material_id):
-    material = db.session.get(StudyMaterial, material_id)
 
-    if not material or material.user_id != session["user_id"]:
-        abort(404)
+    material = StudyMaterial.query.filter_by(
+        id=material_id,
+        user_id=session["user_id"]
+    ).first_or_404()
 
     return page(f"""
     <div class="card">
-    <h2>{escape(material.course_name)}</h2>
-    <p><b>File:</b> {escape(material.original_name)}</p>
-    <h3>Extracted Study Material</h3>
-    <pre style="white-space:pre-wrap;overflow-wrap:anywhere;">{escape(material.extracted_text)}</pre>
-    <a class="btn" href="/dashboard">Back to Dashboard</a>
+        <h2>{escape(material.filename)}</h2>
+
+        <pre style="white-space:pre-wrap;">{escape(material.extracted_text[:15000])}</pre>
+
+        <a href="/">Back to Dashboard</a>
     </div>
     """)
+    # ==========================================
+# AI QUESTION GENERATION
+# ==========================================
+
+import json
 
 
-# CBT EXAMINATION
-
-@app.route("/exam/<int:course_id>/<exam_type>", methods=["GET", "POST"])
+@app.route("/generate-questions", methods=["POST"])
 @login_required
-def exam(course_id, exam_type):
-    course = db.session.get(Course, course_id)
+def generate_questions():
 
-    if not course or exam_type not in ["tma", "semester"]:
-        return "Invalid course or examination type.", 404
+    material_id = request.form.get("material_id")
 
-    limit = 30 if exam_type == "tma" else 70
+    material = StudyMaterial.query.filter_by(
+        id=material_id,
+        user_id=session["user_id"]
+    ).first_or_404()
 
-    questions = Question.query.filter_by(
-        course_id=course_id
-    ).all()
+    try:
+        raw_response = generate_ai_questions(
+            material.extracted_text,
+            material.filename,
+            30
+        )
 
-    if len(questions) < limit:
-        return page(f"""
-        <div class="card">
-        <h3>{escape(course.code)}: {escape(course.title)}</h3>
-        <p>There are currently {len(questions)} questions in this course.
-        At least {limit} questions are needed for this practice pack.</p>
-        <a href="/dashboard">Return to dashboard</a>
-        </div>
-        """)
+        cleaned = raw_response.strip()
 
-    if request.method == "POST":
-        selected = session.get("exam_questions", [])
-        score = 0
-        review = ""
+        if cleaned.startswith("```"):
+            cleaned = cleaned.replace("```json", "")
+            cleaned = cleaned.replace("```", "").strip()
 
-        for qid in selected:
-            q = db.session.get(Question, qid)
+        questions = json.loads(cleaned)
 
-            if not q:
+        if not isinstance(questions, list) or not questions:
+            raise ValueError("AI returned no questions.")
+
+        saved_count = 0
+
+        for item in questions:
+
+            answer = str(item.get("answer", "")).upper().strip()
+
+            if answer not in ["A", "B", "C", "D"]:
                 continue
 
-            choice = request.form.get(str(qid), "").upper()
-            correct = q.answer.upper()
+            question = GeneratedQuestion(
+                user_id=session["user_id"],
+                course_id=material.course_id,
+                material_id=material.id,
+                question_text=str(item.get("question", "")),
+                option_a=str(item.get("A", "")),
+                option_b=str(item.get("B", "")),
+                option_c=str(item.get("C", "")),
+                option_d=str(item.get("D", "")),
+                correct_answer=answer,
+                explanation=str(item.get("explanation", ""))
+            )
 
-            if choice == correct:
+            if question.question_text.strip():
+                db.session.add(question)
+                saved_count += 1
+
+        db.session.commit()
+
+        if saved_count == 0:
+            raise ValueError("No valid questions were generated.")
+
+        flash(
+            f"{saved_count} AI questions generated successfully."
+        )
+
+        return redirect(
+            url_for("ai_practice", material_id=material.id)
+        )
+
+    except Exception as error:
+
+        db.session.rollback()
+
+        flash(
+            "AI question generation failed. "
+            "Check your Gemini API key and study material."
+        )
+
+        return redirect(url_for("dashboard"))
+
+
+# ==========================================
+# AI PRACTICE EXAMINATION
+# ==========================================
+
+@app.route(
+    "/ai-practice/<int:material_id>",
+    methods=["GET", "POST"]
+)
+@login_required
+def ai_practice(material_id):
+
+    material = StudyMaterial.query.filter_by(
+        id=material_id,
+        user_id=session["user_id"]
+    ).first_or_404()
+
+    questions = GeneratedQuestion.query.filter_by(
+        user_id=session["user_id"],
+        material_id=material.id
+    ).order_by(
+        GeneratedQuestion.id
+    ).all()
+
+    if not questions:
+        flash("No AI questions are available for this material.")
+        return redirect(url_for("dashboard"))
+
+    if request.method == "POST":
+
+        score = 0
+        review_html = ""
+
+        for question in questions:
+
+            selected = request.form.get(
+                f"answer_{question.id}", ""
+            ).upper()
+
+            correct = question.correct_answer.upper()
+
+            is_correct = selected == correct
+
+            if is_correct:
                 score += 1
 
-            review += f"""
-            <div class="card">
-            <b>{escape(q.question)}</b>
-            <p>Your answer: {escape(choice or 'Not answered')}
-            | Correct: {escape(correct)}</p>
-            <p>{escape(q.explanation or '')}</p>
+            review_html += f"""
+            <div class="question">
+                <h3>{escape(question.question_text)}</h3>
+
+                <p>Your answer:
+                <strong>{escape(selected or "Not answered")}</strong>
+                </p>
+
+                <p>Correct answer:
+                <strong>{escape(correct)}</strong>
+                </p>
+
+                <p>
+                {"<strong style='color:green'>Correct</strong>" if is_correct else "<strong style='color:red'>Incorrect</strong>"}
+                </p>
+
+                <p>Explanation:
+                {escape(question.explanation or "No explanation provided.")}
+                </p>
             </div>
             """
 
-        total = len(selected)
+        if material.course_id:
+            attempt = Attempt(
+                user_id=session["user_id"],
+                course_id=material.course_id,
+                score=score,
+                total_questions=len(questions),
+                exam_type="AI Practice"
+            )
 
-        attempt = Attempt(
-            user_id=session["user_id"],
-            course_id=course_id,
-            score=score,
-            total=total,
-            exam_type=exam_type.upper()
+            db.session.add(attempt)
+            db.session.commit()
+
+        percentage = round(
+            (score / len(questions)) * 100, 1
         )
-
-        db.session.add(attempt)
-        db.session.commit()
-
-        session.pop("exam_questions", None)
-
-        percentage = round(score / total * 100) if total else 0
 
         return page(f"""
         <div class="card">
-        <h2>Examination Result</h2>
-        <h1>{score}/{total}</h1>
-        <p>Percentage: {percentage}%</p>
-        <a class="btn" href="/dashboard">Return to Dashboard</a>
+            <h2>AI Practice Result</h2>
+
+            <h1>{score}/{len(questions)}</h1>
+
+            <h2>{percentage}%</h2>
+
+            <p>You have completed your AI practice examination.</p>
+
+            <a class="btn" href="/">Back to Dashboard</a>
         </div>
-        <h3>Corrections and Explanations</h3>{review}
+
+        <div class="card">
+            <h2>Corrections and Explanations</h2>
+            {review_html}
+        </div>
         """)
 
-    chosen = random.sample(questions, limit)
-    session["exam_questions"] = [q.id for q in chosen]
+    questions_html = ""
 
-    fields = ""
+    for number, question in enumerate(questions, 1):
 
-    for i, q in enumerate(chosen, 1):
-        fields += f"""
-        <div class="card">
-        <b>{i}. {escape(q.question)}</b>
+        questions_html += f"""
+        <div class="question">
+
+            <h3>{number}. {escape(question.question_text)}</h3>
+
+            <label>
+                <input type="radio"
+                       name="answer_{question.id}"
+                       value="A" required>
+                A. {escape(question.option_a)}
+            </label>
+
+            <br>
+
+            <label>
+                <input type="radio"
+                       name="answer_{question.id}"
+                       value="B">
+                B. {escape(question.option_b)}
+            </label>
+
+            <br>
+
+            <label>
+                <input type="radio"
+                       name="answer_{question.id}"
+                       value="C">
+                C. {escape(question.option_c)}
+            </label>
+
+            <br>
+
+            <label>
+                <input type="radio"
+                       name="answer_{question.id}"
+                       value="D">
+                D. {escape(question.option_d)}
+            </label>
+
+        </div>
         """
-
-        for letter, option in [
-            ("A", q.a), ("B", q.b), ("C", q.c), ("D", q.d)
-        ]:
-            fields += f"""
-            <p><label>
-            <input style="width:auto" type="radio"
-            name="{q.id}" value="{letter}">
-            {letter}. {escape(option)}
-            </label></p>
-            """
-
-        fields += "</div>"
 
     return page(f"""
     <div class="card">
-    <h2>{escape(course.code)} - {exam_type.upper()} Practice</h2>
-    <p>Questions: {limit} | Each question carries 1 mark.</p>
-    <form method="post">
-    {fields}
-    <button type="submit">Submit Examination</button>
-    </form>
+        <h2>AI Practice Examination</h2>
+
+        <p>Material: {escape(material.filename)}</p>
+
+        <p>Total Questions: {len(questions)}</p>
+
+        <form method="POST">
+
+            {questions_html}
+
+            <button type="submit" class="gold">
+                Submit Examination
+            </button>
+
+        </form>
     </div>
     """)
 
 
+# ==========================================
+# STANDARD CBT EXAMINATION
+# ==========================================
+
+@app.route("/exam/<int:course_id>", methods=["GET"])
+@login_required
+def start_exam(course_id):
+
+    course = db.session.get(Course, course_id)
+
+    if not course:
+        abort(404)
+
+    questions = Question.query.filter_by(
+        course_id=course.id
+    ).all()
+
+    if not questions:
+        flash("No examination questions have been added for this course.")
+        return redirect(url_for("dashboard"))
+
+    selected_questions = random.sample(
+        questions,
+        min(30, len(questions))
+    )
+
+    session["exam_question_ids"] = [
+        question.id for question in selected_questions
+    ]
+
+    session["exam_course_id"] = course.id
+
+    question_html = ""
+
+    for number, question in enumerate(selected_questions, 1):
+
+        question_html += f"""
+        <div class="question">
+
+            <h3>{number}. {escape(question.question_text)}</h3>
+
+            <label>
+                <input type="radio"
+                       name="answer_{question.id}"
+                       value="A" required>
+                A. {escape(question.option_a or "")}
+            </label>
+
+            <br>
+
+            <label>
+                <input type="radio"
+                       name="answer_{question.id}"
+                       value="B">
+                B. {escape(question.option_b or "")}
+            </label>
+
+            <br>
+
+            <label>
+                <input type="radio"
+                       name="answer_{question.id}"
+                       value="C">
+                C. {escape(question.option_c or "")}
+            </label>
+
+            <br>
+
+            <label>
+                <input type="radio"
+                       name="answer_{question.id}"
+                       value="D">
+                D. {escape(question.option_d or "")}
+            </label>
+
+        </div>
+        """
+
+    return page(f"""
+    <div class="card">
+        <h2>{escape(course.code)} Examination</h2>
+
+        <p>{escape(course.title)}</p>
+
+        <p>Total Questions: {len(selected_questions)}</p>
+
+        <form method="POST" action="/submit-exam/{course.id}">
+
+            {question_html}
+
+            <button type="submit" class="gold">
+                Submit Examination
+            </button>
+
+        </form>
+    </div>
+    """)
+
+
+@app.route(
+    "/submit-exam/<int:course_id>",
+    methods=["POST"]
+)
+@login_required
+def submit_exam(course_id):
+
+    if session.get("exam_course_id") != course_id:
+        flash("Your examination session has expired.")
+        return redirect(url_for("dashboard"))
+
+    question_ids = session.get("exam_question_ids", [])
+
+    if not question_ids:
+        flash("No active examination was found.")
+        return redirect(url_for("dashboard"))
+
+    questions = Question.query.filter(
+        Question.id.in_(question_ids),
+        Question.course_id == course_id
+    ).all()
+
+    score = 0
+    review_html = ""
+
+    for question in questions:
+
+        selected = request.form.get(
+            f"answer_{question.id}", ""
+        ).upper()
+
+        correct = question.correct_answer.upper()
+
+        is_correct = selected == correct
+
+        if is_correct:
+            score += 1
+
+        review_html += f"""
+        <div class="question">
+
+            <h3>{escape(question.question_text)}</h3>
+
+            <p>Your answer:
+            {escape(selected or "Not answered")}</p>
+
+            <p>Correct answer:
+            <strong>{escape(correct)}</strong></p>
+
+            <p>
+            {"<strong style='color:green'>Correct</strong>" if is_correct else "<strong style='color:red'>Incorrect</strong>"}
+            </p>
+
+            <p>{escape(question.explanation or "")}</p>
+
+        </div>
+        """
+
+    attempt = Attempt(
+        user_id=session["user_id"],
+        course_id=course_id,
+        score=score,
+        total_questions=len(questions),
+        exam_type="CBT"
+    )
+
+    db.session.add(attempt)
+    db.session.commit()
+
+    session.pop("exam_question_ids", None)
+    session.pop("exam_course_id", None)
+
+    percentage = round(
+        (score / len(questions)) * 100, 1
+    ) if questions else 0
+
+    return page(f"""
+    <div class="card">
+        <h2>Examination Result</h2>
+
+        <h1>{score}/{len(questions)}</h1>
+
+        <h2>{percentage}%</h2>
+
+        <a class="btn" href="/">Back to Dashboard</a>
+    </div>
+
+    <div class="card">
+        <h2>Corrections and Explanations</h2>
+
+        {review_html}
+    </div>
+    """)
+
+
+# ==========================================
 # ADMIN DASHBOARD
+# ==========================================
 
 @app.route("/admin")
 @login_required
 @admin_required
-def admin():
-    courses = Course.query.order_by(Course.code).all()
+def admin_dashboard():
 
-    course_list = "".join(
-        f"<p>{escape(c.code)} - {escape(c.title)} | "
-        f"{Question.query.filter_by(course_id=c.id).count()} questions</p>"
-        for c in courses
-    )
+    users = User.query.order_by(
+        User.created_at.desc()
+    ).all()
 
-    options = "".join(
-        f"<option value='{c.id}'>{escape(c.code)} - {escape(c.title)}</option>"
-        for c in courses
-    )
+    courses = Course.query.order_by(
+        Course.code
+    ).all()
+
+    questions = Question.query.order_by(
+        Question.id.desc()
+    ).limit(30).all()
+
+    user_html = ""
+
+    for user in users:
+        user_html += f"""
+        <div class="question">
+            <strong>{escape(user.name)}</strong>
+            <br>
+            {escape(user.email)}
+            <br>
+            {"Administrator" if user.is_admin else "Student"}
+        </div>
+        """
+
+    course_html = ""
+
+    for course in courses:
+        course_html += f"""
+        <div class="question">
+            <strong>{escape(course.code)}</strong>
+            — {escape(course.title)}
+        </div>
+        """
+
+    question_html = ""
+
+    for question in questions:
+        question_html += f"""
+        <div class="question">
+            {escape(question.question_text)}
+            <br>
+            Correct Answer:
+            <strong>{escape(question.correct_answer)}</strong>
+        </div>
+        """
 
     return page(f"""
     <div class="card">
-    <h2>Administrator Dashboard</h2>
-    <h3>Add Course</h3>
-    <form method="post" action="/admin/course">
-    <input name="code" placeholder="Course code e.g. ECO101" required>
-    <input name="title" placeholder="Course title" required>
-    <button>Add Course</button>
-    </form>
+        <h2>Administrator Dashboard</h2>
+
+        <p>Manage students, courses and examination questions.</p>
+
+        <a class="btn" href="/">Student Dashboard</a>
     </div>
 
     <div class="card">
-    <h3>Upload Questions</h3>
-    <form method="post" action="/admin/question">
-    <select name="course_id" required>{options}</select>
-    <textarea name="question" placeholder="Enter question" required></textarea>
-    <input name="a" placeholder="Option A" required>
-    <input name="b" placeholder="Option B" required>
-    <input name="c" placeholder="Option C" required>
-    <input name="d" placeholder="Option D" required>
-    <select name="answer">
-    <option>A</option><option>B</option>
-    <option>C</option><option>D</option>
-    </select>
-    <textarea name="explanation" placeholder="Explanation (optional)"></textarea>
-    <button>Add Question</button>
-    </form>
+        <h2>Add New Course</h2>
+
+        <form method="POST" action="/admin/course">
+
+            <label>Course Code</label>
+            <input name="code" required>
+
+            <label>Course Title</label>
+            <input name="title" required>
+
+            <button type="submit">Add Course</button>
+
+        </form>
     </div>
 
     <div class="card">
-    <h3>Courses</h3>
-    {course_list}
+        <h2>Add Examination Question</h2>
+
+        <form method="POST" action="/admin/question">
+
+            <label>Select Course</label>
+
+            <select name="course_id" required>
+                {''.join(
+                    f'<option value="{c.id}">{escape(c.code)} - {escape(c.title)}</option>'
+                    for c in courses
+                )}
+            </select>
+
+            <label>Question</label>
+            <textarea name="question_text" required></textarea>
+
+            <label>Option A</label>
+            <input name="option_a" required>
+
+            <label>Option B</label>
+            <input name="option_b" required>
+
+            <label>Option C</label>
+            <input name="option_c" required>
+
+            <label>Option D</label>
+            <input name="option_d" required>
+
+            <label>Correct Answer</label>
+
+            <select name="correct_answer" required>
+                <option value="A">A</option>
+                <option value="B">B</option>
+                <option value="C">C</option>
+                <option value="D">D</option>
+            </select>
+
+            <label>Explanation</label>
+            <textarea name="explanation"></textarea>
+
+            <button type="submit">Save Question</button>
+
+        </form>
     </div>
 
-    <a href="/dashboard">Back to Dashboard</a>
+    <div class="card">
+        <h2>Registered Users ({len(users)})</h2>
+        {user_html or "<p>No users yet.</p>"}
+    </div>
+
+    <div class="card">
+        <h2>Available Courses ({len(courses)})</h2>
+        {course_html or "<p>No courses have been added.</p>"}
+    </div>
+
+    <div class="card">
+        <h2>Recently Added Questions</h2>
+        {question_html or "<p>No questions have been added.</p>"}
+    </div>
     """)
 
+
+# ==========================================
+# ADMIN COURSE MANAGEMENT
+# ==========================================
 
 @app.route("/admin/course", methods=["POST"])
 @login_required
 @admin_required
 def add_course():
+
+    code = request.form.get("code", "").strip().upper()
+
+    title = request.form.get("title", "").strip()
+
+    if not code or not title:
+        flash("Enter both course code and title.")
+        return redirect(url_for("admin_dashboard"))
+
+    existing = Course.query.filter_by(code=code).first()
+
+    if existing:
+        flash("This course code already exists.")
+        return redirect(url_for("admin_dashboard"))
+
     course = Course(
-        code=request.form["code"].strip().upper(),
-        title=request.form["title"].strip()
+        code=code,
+        title=title
     )
 
     db.session.add(course)
     db.session.commit()
 
-    return redirect(url_for("admin"))
+    flash("Course added successfully.")
 
+    return redirect(url_for("admin_dashboard"))
+
+
+# ==========================================
+# ADMIN QUESTION MANAGEMENT
+# ==========================================
 
 @app.route("/admin/question", methods=["POST"])
 @login_required
 @admin_required
 def add_question():
-    q = Question(
-        course_id=int(request.form["course_id"]),
-        question=request.form["question"],
-        a=request.form["a"],
-        b=request.form["b"],
-        c=request.form["c"],
-        d=request.form["d"],
-        answer=request.form["answer"].upper(),
-        explanation=request.form.get("explanation", "")
+
+    course_id = request.form.get("course_id")
+
+    question_text = request.form.get(
+        "question_text", ""
+    ).strip()
+
+    option_a = request.form.get("option_a", "").strip()
+    option_b = request.form.get("option_b", "").strip()
+    option_c = request.form.get("option_c", "").strip()
+    option_d = request.form.get("option_d", "").strip()
+
+    correct_answer = request.form.get(
+        "correct_answer", ""
+    ).upper().strip()
+
+    explanation = request.form.get(
+        "explanation", ""
+    ).strip()
+
+    if not course_id or not question_text:
+        flash("Complete the required question fields.")
+        return redirect(url_for("admin_dashboard"))
+
+    if correct_answer not in ["A", "B", "C", "D"]:
+        flash("Select a valid correct answer.")
+        return redirect(url_for("admin_dashboard"))
+
+    course = db.session.get(Course, int(course_id))
+
+    if not course:
+        flash("Selected course does not exist.")
+        return redirect(url_for("admin_dashboard"))
+
+    question = Question(
+        course_id=course.id,
+        question_text=question_text,
+        option_a=option_a,
+        option_b=option_b,
+        option_c=option_c,
+        option_d=option_d,
+        correct_answer=correct_answer,
+        explanation=explanation
     )
 
-    db.session.add(q)
+    db.session.add(question)
     db.session.commit()
 
-    return redirect(url_for("admin"))
+    flash("Examination question added successfully.")
+
+    return redirect(url_for("admin_dashboard"))
 
 
-# DATABASE INITIALISATION
+# ==========================================
+# DATABASE INITIALIZATION
+# ==========================================
 
 with app.app_context():
+
     db.create_all()
 
-    admin_email = os.environ.get("ADMIN_EMAIL")
-    admin_password = os.environ.get("ADMIN_PASSWORD")
+    admin_email = os.environ.get("ADMIN_EMAIL", "").lower().strip()
+
+    admin_password = os.environ.get("ADMIN_PASSWORD", "")
 
     if admin_email and admin_password:
+
         existing = User.query.filter_by(
-            email=admin_email.lower()
+            email=admin_email
         ).first()
 
         if not existing:
+
             db.session.add(User(
                 name="Administrator",
-                email=admin_email.lower(),
+                email=admin_email,
                 password=generate_password_hash(admin_password),
                 is_admin=True
             ))
+
             db.session.commit()
 
+
+# ==========================================
+# APPLICATION START
+# ==========================================
 
 if __name__ == "__main__":
     app.run()
